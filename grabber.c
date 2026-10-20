@@ -4,6 +4,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -63,7 +65,7 @@ int main(int argc, char *argv[]) {
 
   int ev_fd = find_and_grab_gamepad();
   if (ev_fd < 0) {
-    fprintf(stderr, "No active gamepad found across /dev/input/event*\n");
+    fprintf(stderr, "No gamepad found\n");
     return EXIT_FAILURE;
   }
 

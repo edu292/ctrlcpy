@@ -9,6 +9,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef htole32
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define htole32(x) __builtin_bswap32((uint32_t)(x))
+#else
+#define htole32(x) ((uint32_t)(x))
+#endif
+#endif
+
 constexpr char SOCKET_NAME[] = "ctrlcpy";
 constexpr char LOCAL_BIN[] = "grabber";
 constexpr char REMOTE_BIN[] = "/data/local/tmp/grabber";
@@ -40,6 +48,20 @@ static bool read_all(int fd, void *buf, size_t len) {
     }
 
     received += n;
+  }
+
+  return true;
+}
+
+static bool write_all(int fd, const void *buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = write(fd, (const char *)buf + sent, len - sent);
+    if (n <= 0) {
+      return false;
+    }
+
+    sent += n;
   }
 
   return true;
@@ -270,11 +292,11 @@ int main(void) {
     cleanup_and_exit(1);
   }
 
-  char ready_buf[16];
+  char ready_buf[128];
   ssize_t rlen = read(grabber_proc_fd, ready_buf, sizeof(ready_buf) - 1);
   if (rlen <= 0 || strstr(ready_buf, "READY") == nullptr) {
     ready_buf[rlen > 0 ? rlen : 0] = '\0';
-    fprintf(stderr, "Grabber failed to start. Remote output: %s\n", ready_buf);
+    fprintf(stderr, "Grabber failed to start: %s\n", ready_buf);
     cleanup_and_exit(1);
   }
 
@@ -287,8 +309,11 @@ int main(void) {
   }
 
   struct input_event ev;
-  while (read(data_sock, &ev, sizeof(ev)) == sizeof(ev)) {
-    write(uinput_fd, &ev, sizeof(ev));
+  while (read_all(data_sock, &ev, sizeof(ev))) {
+    if (!write_all(uinput_fd, &ev, sizeof(ev))) {
+      perror("Failed to forward input_event to uinput");
+      break;
+    }
   }
 
   cleanup_and_exit(0);

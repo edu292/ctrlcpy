@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,15 +23,17 @@ jobs:
       - name: Build Android grabber
         run: |
           $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
-            -O3 -s grabber.c -o grabber
+            -std=c23 -O3 -s grabber.c -o grabber
 
       - name: Build Host
         run: |
-          gcc -std=c23 -O3 ctrlcpy.c -o ctrlcpy
+          sudo apt-get update && sudo apt-get install -y gcc-14
+          gcc-14 -std=c23 -O3 ctrlcpy.c -o ctrlcpy
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ctrlcpy
-            grabber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" ctrlcpy grabber \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes

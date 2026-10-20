@@ -1,19 +1,15 @@
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/uinput.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
-constexpr uint32_t FORWARD_PORT = 12345;
+constexpr char SOCKET_NAME[] = "ctrlcpy";
 constexpr char LOCAL_BIN[] = "grabber";
 constexpr char REMOTE_BIN[] = "/data/local/tmp/grabber";
 
@@ -32,11 +28,68 @@ void cleanup_and_exit([[maybe_unused]] int sig) {
     ioctl(uinput_fd, UI_DEV_DESTROY);
     close(uinput_fd);
   }
-
   exit(0);
 }
 
-static int adb_connect_server() {
+static bool read_all(int fd, void *buf, size_t len) {
+  size_t received = 0;
+  while (received < len) {
+    ssize_t n = read(fd, (char *)buf + received, len - received);
+    if (n <= 0) {
+      return false;
+    }
+
+    received += n;
+  }
+
+  return true;
+}
+
+static bool adb_okay(int fd) {
+  char status[4];
+  if (!read_all(fd, status, 4)) {
+    return false;
+  }
+
+  if (memcmp(status, "OKAY", 4) == 0) {
+    return true;
+  }
+
+  if (memcmp(status, "FAIL", 4) == 0) {
+    char len_hex[5] = {};
+    if (read_all(fd, len_hex, 4)) {
+      uint32_t msg_len = 0;
+      sscanf(len_hex, "%04x", &msg_len);
+      char err_msg[256];
+      size_t to_read =
+          msg_len < sizeof(err_msg) - 1 ? msg_len : sizeof(err_msg) - 1;
+      if (read_all(fd, err_msg, to_read)) {
+        err_msg[to_read] = '\0';
+        fprintf(stderr, "ADB Error: %s\n", err_msg);
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool adb_send_req(int fd, const char *service) {
+  size_t len = strlen(service);
+  if (len > 0xffff) {
+    return false;
+  }
+
+  char header[5];
+  snprintf(header, sizeof(header), "%04zx", len);
+  struct iovec iov[2] = {
+      {.iov_base = header, .iov_len = 4},
+      {.iov_base = (void *)service, .iov_len = len},
+  };
+
+  return writev(fd, iov, 2) == (ssize_t)(4 + len) && adb_okay(fd);
+}
+
+static int adb_open(const char *service) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
@@ -48,7 +101,9 @@ static int adb_connect_server() {
       .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
   };
 
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      !adb_send_req(fd, "host:transport-any") ||
+      (service && !adb_send_req(fd, service))) {
     close(fd);
     return -1;
   }
@@ -56,31 +111,22 @@ static int adb_connect_server() {
   return fd;
 }
 
-static bool adb_send_cmd(int fd, const char *service) {
-  char header[5];
-  size_t len = strlen(service);
-  snprintf(header, sizeof(header), "%04zx", len);
-
-  if (write(fd, header, 4) != 4 || write(fd, service, len) != (ssize_t)len) {
-    return false;
+static int adb_exec(const char *cmd, bool sync) {
+  char service[256];
+  snprintf(service, sizeof(service), "exec:%s", cmd);
+  int fd = adb_open(service);
+  if (fd < 0) {
+    return -1;
   }
 
-  char status[4];
-  return !(read(fd, status, 4) != 4 || memcmp(status, "OKAY", 4) != 0);
-}
-
-static bool write_all(int fd, const void *buf, size_t len) {
-  size_t sent = 0;
-  while (sent < len) {
-    ssize_t n = write(fd, (const char *)buf + sent, len - sent);
-    if (n <= 0) {
-      return false;
-    }
-
-    sent += n;
+  if (sync) {
+    char buf[128];
+    read_all(fd, buf, sizeof(buf));
+    close(fd);
+    return 0;
   }
 
-  return true;
+  return fd;
 }
 
 static bool adb_push(const char *local_path, const char *remote_path,
@@ -90,115 +136,62 @@ static bool adb_push(const char *local_path, const char *remote_path,
     return false;
   }
 
-  int fd = adb_connect_server();
+  int fd = adb_open("sync:");
   if (fd < 0) {
     close(local_fd);
-    return false;
-  }
-
-  if (!adb_send_cmd(fd, "host:transport-any") || !adb_send_cmd(fd, "sync:")) {
-    close(local_fd);
-    close(fd);
     return false;
   }
 
   char target[256];
   int target_len =
       snprintf(target, sizeof(target), "%s,%o", remote_path, mode & 0777);
-  uint32_t len_le = target_len;
+  uint32_t target_len_le = htole32((uint32_t)target_len);
 
-  if (!write_all(fd, "SEND", 4) || !write_all(fd, &len_le, 4) ||
-      !write_all(fd, target, target_len)) {
-    close(local_fd);
-    close(fd);
-    return false;
+  struct iovec send_hdr[3] = {
+      {.iov_base = (void *)"SEND", .iov_len = 4},
+      {.iov_base = &target_len_le, .iov_len = 4},
+      {.iov_base = target, .iov_len = (size_t)target_len},
+  };
+  if (writev(fd, send_hdr, 3) < 0) {
+    goto err;
   }
 
   char chunk[64 * 1024];
   ssize_t n;
   while ((n = read(local_fd, chunk, sizeof(chunk))) > 0) {
-    uint32_t chunk_len = (uint32_t)n;
-    if (!write_all(fd, "DATA", 4) || !write_all(fd, &chunk_len, 4) ||
-        !write_all(fd, chunk, chunk_len)) {
-      close(local_fd);
-      close(fd);
-      return false;
+    uint32_t chunk_len_le = htole32((uint32_t)n);
+    struct iovec data_iov[3] = {
+        {.iov_base = (void *)"DATA", .iov_len = 4},
+        {.iov_base = &chunk_len_le, .iov_len = 4},
+        {.iov_base = chunk, .iov_len = (size_t)n},
+    };
+    if (writev(fd, data_iov, 3) < 0) {
+      goto err;
     }
   }
   close(local_fd);
+  local_fd = -1;
 
-  uint32_t now = (uint32_t)time(nullptr);
-  if (!write_all(fd, "DONE", 4) || !write_all(fd, &now, 4)) {
+  uint32_t now_le = htole32((uint32_t)time(NULL));
+  struct iovec done_iov[2] = {
+      {.iov_base = (void *)"DONE", .iov_len = 4},
+      {.iov_base = &now_le, .iov_len = 4},
+  };
+  if (writev(fd, done_iov, 2) < 0) {
     close(fd);
     return false;
   }
 
-  char status[4];
-  bool ok = (read(fd, status, 4) == 4 && memcmp(status, "OKAY", 4) == 0);
+  bool ok = adb_okay(fd);
   close(fd);
   return ok;
-}
 
-static bool adb_exec_sync(const char *cmd) {
-  int fd = adb_connect_server();
-  if (fd < 0) {
-    return false;
+err:
+  if (local_fd >= 0) {
+    close(local_fd);
   }
-
-  if (!adb_send_cmd(fd, "host:transport-any")) {
-    close(fd);
-    return false;
-  }
-
-  char service[256];
-  snprintf(service, sizeof(service), "shell:%s", cmd);
-  if (!adb_send_cmd(fd, service)) {
-    close(fd);
-    return false;
-  }
-
-  char buf[64];
-  while (read(fd, buf, sizeof(buf)) > 0) {
-  }
-
   close(fd);
-  return true;
-}
-
-static int adb_exec_spawn(const char *cmd) {
-  int fd = adb_connect_server();
-  if (fd < 0) {
-    return -1;
-  }
-
-  if (!adb_send_cmd(fd, "host:transport-any")) {
-    close(fd);
-    return -1;
-  }
-
-  char service[256];
-  snprintf(service, sizeof(service), "shell:%s", cmd);
-  if (!adb_send_cmd(fd, service)) {
-    close(fd);
-    return -1;
-  }
-
-  return fd;
-}
-
-static bool adb_setup_forward(int local_port, int remote_port) {
-  int fd = adb_connect_server();
-  if (fd < 0) {
-    return false;
-  }
-
-  char cmd[64];
-  snprintf(cmd, sizeof(cmd), "host:forward:tcp:%d;tcp:%d", local_port,
-           remote_port);
-
-  bool res = adb_send_cmd(fd, cmd);
-  close(fd);
-  return res;
+  return false;
 }
 
 static void setup_abs(int fd, uint16_t code, int32_t min, int32_t max,
@@ -267,22 +260,17 @@ int main(void) {
     cleanup_and_exit(1);
   }
 
-  if (!adb_setup_forward(FORWARD_PORT, FORWARD_PORT)) {
-    fprintf(stderr, "Failed to establish ADB forward rule\n");
-    cleanup_and_exit(1);
-  }
-
-  adb_exec_sync("cmd display power-off 0");
+  adb_exec("cmd display power-off 0", true);
 
   char run_cmd[128];
-  snprintf(run_cmd, sizeof(run_cmd), "%s %u", REMOTE_BIN, FORWARD_PORT);
-  grabber_proc_fd = adb_exec_spawn(run_cmd);
+  snprintf(run_cmd, sizeof(run_cmd), "%s %s", REMOTE_BIN, SOCKET_NAME);
+  grabber_proc_fd = adb_exec(run_cmd, false);
   if (grabber_proc_fd < 0) {
     fprintf(stderr, "Failed to spawn grabber process on phone\n");
     cleanup_and_exit(1);
   }
 
-  char ready_buf[256];
+  char ready_buf[16];
   ssize_t rlen = read(grabber_proc_fd, ready_buf, sizeof(ready_buf) - 1);
   if (rlen <= 0 || strstr(ready_buf, "READY") == nullptr) {
     ready_buf[rlen > 0 ? rlen : 0] = '\0';
@@ -290,18 +278,11 @@ int main(void) {
     cleanup_and_exit(1);
   }
 
-  data_sock = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in addr = {
-      .sin_family = AF_INET,
-      .sin_port = htons(FORWARD_PORT),
-      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-  };
-
-  int flag = 1;
-  setsockopt(data_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-  if (connect(data_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("Failed to connect to data socket");
+  char sock_service[64];
+  snprintf(sock_service, sizeof(sock_service), "localabstract:%s", SOCKET_NAME);
+  data_sock = adb_open(sock_service);
+  if (data_sock < 0) {
+    fprintf(stderr, "Failed to connect to socket: %s\n", sock_service);
     cleanup_and_exit(1);
   }
 

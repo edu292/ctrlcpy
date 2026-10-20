@@ -1,26 +1,24 @@
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/input.h>
-#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
-#define TEST_BIT(bit, array) (((array)[(bit) >> 5] >> ((bit) & 31)) & 1U)
+static inline bool ev_has_key(const uint32_t *bits, size_t key) {
+  return (bits[key / 32] & (1U << (key % 32))) != 0;
+}
 
 static bool is_gamepad(int fd) {
-  uint32_t key_bits[10] = {0};
+  uint32_t key_bits[10] = {};
 
   if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
     return false;
   }
 
-  return TEST_BIT(BTN_GAMEPAD, key_bits);
+  return ev_has_key(key_bits, BTN_GAMEPAD);
 }
 
 int find_and_grab_gamepad(void) {
@@ -48,11 +46,19 @@ int find_and_grab_gamepad(void) {
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+    fprintf(stderr, "Usage: %s <socket_name>\n", argv[0]);
     return EXIT_FAILURE;
   }
 
-  int port = atoi(argv[1]);
+  const char *socket_name = argv[1];
+  size_t socket_name_len = strlen(socket_name);
+  size_t max_name_len = sizeof(((struct sockaddr_un *)0)->sun_path) - 1;
+  if (socket_name_len > max_name_len) {
+    fprintf(stderr, "Socket name exceeds max allowed length (%zu bytes)\n",
+            max_name_len);
+    return EXIT_FAILURE;
+  }
+
   signal(SIGPIPE, SIG_IGN);
 
   int ev_fd = find_and_grab_gamepad();
@@ -61,22 +67,19 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (server_fd < 0) {
     close(ev_fd);
     return EXIT_FAILURE;
   }
 
-  int opt = 1;
-  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  addr.sun_path[0] = '\0';
+  memcpy(&addr.sun_path[1], socket_name, socket_name_len);
 
-  struct sockaddr_in saddr = {
-      .sin_family = AF_INET,
-      .sin_port = htons(port),
-      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-  };
-
-  if (bind(server_fd, (struct sockaddr *)&saddr, sizeof(saddr)) < 0 ||
+  socklen_t addr_len =
+      offsetof(struct sockaddr_un, sun_path) + 1 + socket_name_len;
+  if (bind(server_fd, (struct sockaddr *)&addr, addr_len) < 0 ||
       listen(server_fd, 1) < 0) {
     close(server_fd);
     close(ev_fd);
@@ -86,14 +89,12 @@ int main(int argc, char *argv[]) {
   printf("READY\n");
   fflush(stdout);
 
-  int client_fd = accept(server_fd, NULL, NULL);
+  int client_fd = accept(server_fd, nullptr, nullptr);
   close(server_fd);
   if (client_fd < 0) {
     close(ev_fd);
     return EXIT_FAILURE;
   }
-
-  setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
   struct input_event ev;
   while (read(ev_fd, &ev, sizeof(ev)) == sizeof(ev)) {
